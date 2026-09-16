@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -22,13 +23,20 @@ from runtime import INSTRUCTIONS, TOOLS, VERSION, Runtime, repository
 SOURCE = Path(__file__).resolve().parent
 
 
+def reject_symlinks(path):
+    """Check existing components before resolving or writing owned paths."""
+    for component in (path, *path.parents):
+        if component.is_symlink():
+            raise ValueError(f"Refusing symlink in installation path: {component}")
+
+
 def read(path):
-    if path.is_symlink():
-        raise ValueError(f"Refusing to replace symlink: {path}")
+    reject_symlinks(path)
     return path.read_bytes() if path.exists() else None
 
 
 def atomic(path, content):
+    reject_symlinks(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if content is None:
         path.unlink(missing_ok=True)
@@ -121,6 +129,7 @@ class Changes:
             if read(path) != self.before[path]:
                 raise ValueError(f"Configuration changed concurrently: {path}; retry")
         backup = base / "backups" / str(time.time_ns())
+        reject_symlinks(backup)
         backup.mkdir(parents=True)
         metadata = {}
         for number, path in enumerate(changed):
@@ -144,8 +153,8 @@ def agent_paths(agent, scope, root):
     if scope == "project":
         return root / (".codex" if agent == "codex" else ".pi")
     if agent == "codex":
-        return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
-    return Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi/agent"))).expanduser().resolve()
+        return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().absolute()
+    return Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi/agent"))).expanduser().absolute()
 
 
 def binary_path(args, base):
@@ -155,6 +164,7 @@ def binary_path(args, base):
         binary = Path(shutil.which("tgrep")).resolve()
     else:
         binary = base / "bin/tgrep"
+        reject_symlinks(binary)
         if not binary.exists():
             checkout = SOURCE.parent.parent
             built = checkout / "target/release/tgrep"
@@ -211,7 +221,7 @@ def install_agent(agent, args, root, base, binary, changes):
         }]}
         hooks_path = agent_dir / "hooks.json"
         hooks_raw = changes.get(hooks_path)
-        if hooks_raw is not None or "hooks" not in parsed:
+        if "hooks" not in parsed:
             hooks = json.loads(hooks_raw or b"{}")
             had_hooks = "hooks" in hooks
             had_event = "SessionStart" in hooks.get("hooks", {})
@@ -231,12 +241,51 @@ def install_agent(agent, args, root, base, binary, changes):
         substitutions = {"__PYTHON__": sys.executable, "__RUNTIME__": str(runtime), "__CONFIG__": str(configuration),
                          "__TOOLS__": TOOLS, "__INSTRUCTIONS__": INSTRUCTIONS}
         template = (SOURCE / "pi-extension.ts").read_text()
-        for key, value in substitutions.items():
-            template = template.replace(key, json.dumps(value))
+        template = re.sub("|".join(map(re.escape, substitutions)),
+                          lambda match: json.dumps(substitutions[match.group()]), template)
         changes.file(agent_dir / "extensions/tgrep.ts", template.encode(), records)
     if args.scope == "project":
         changes.block(root / ".gitignore", marked(agent, "ignore", "/.tgrep-agent/"), records)
     return {"version": VERSION, "records": records, "config": config}
+
+
+def prepare_records(manifest, agents, scope, root, base, action):
+    """Rebase record locations, never their stored content/checksums, on a move.
+
+    Validate an exact target allowlist before reading any manifest-owned path.
+    Old locations may still exist (a copied checkout); never touch them.
+    """
+    for agent in agents:
+        entry = manifest.get("agents", {}).get(agent)
+        if not entry:
+            continue
+        old_root = entry["config"].get("root")
+        moved = scope == "project" and old_root and Path(old_root) != root
+        if moved and action == "doctor":
+            raise ValueError("Project moved; run repair with --root pointing to the new project before using this integration")
+        agent_dir = agent_paths(agent, scope, root)
+        allowed = {base / agent / "runtime.py", base / agent / "config.json"}
+        if agent == "codex":
+            allowed.update({agent_dir / "config.toml", agent_dir / "hooks.json",
+                            root / "AGENTS.md" if scope == "project" else agent_dir / "AGENTS.md"})
+        else:
+            allowed.add(agent_dir / "extensions/tgrep.ts")
+        if scope == "project":
+            allowed.add(root / ".gitignore")
+        for record in entry["records"]:
+            path = Path(record["path"])
+            if moved:
+                if not path.is_relative_to(old_root):
+                    raise ValueError(f"Manifest path outside original project: {path}")
+                path = root / path.relative_to(old_root)
+            if path not in allowed or ".." in path.parts:
+                raise ValueError(f"Unexpected manifest target: {path}")
+            reject_symlinks(path)
+            record["path"] = str(path)
+        if moved:
+            binary = Path(entry["config"]["binary"])
+            if binary.is_relative_to(old_root):
+                entry["config"]["binary"] = str(root / binary.relative_to(old_root))
 
 
 def doctor(manifest, agents, root):
@@ -317,7 +366,6 @@ def main():
     if args.max_filesize and args.no_max_filesize:
         parser.error("Choose --max-filesize or --no-max-filesize")
     if args.max_filesize:
-        import re
         if not re.fullmatch(r"[0-9]+[KkMmGg]?", args.max_filesize):
             parser.error("--max-filesize must be a byte count or use K/M/G")
     if args.agent is None:
@@ -334,8 +382,18 @@ def main():
         parser.error("--agent must be codex, pi or codex,pi")
     root = repository(args.root)
     data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
-    base = (root / ".tgrep-agent" if args.scope == "project" else data_home / "tgrep-agent").resolve()
+    base = (root / ".tgrep-agent" if args.scope == "project" else data_home.resolve() / "tgrep-agent")
+    reject_symlinks(base)
     manifest_path = base / "manifest.json"
+    # Preflight all selected destinations before creating state, locks or binaries.
+    for agent in agents:
+        agent_dir = agent_paths(agent, args.scope, root)
+        for path in (agent_dir / "config.toml", agent_dir / "hooks.json",
+                     agent_dir / "extensions/tgrep.ts", base / agent / "runtime.py",
+                     base / agent / "config.json"):
+            reject_symlinks(path)
+    for path in (manifest_path, base / "install.lock", base / "backups", root / "AGENTS.md", root / ".gitignore"):
+        reject_symlinks(path)
     if args.action in ("doctor", "uninstall") and not manifest_path.exists():
         print("No tgrep integration installed in this scope.")
         return 1 if args.action == "doctor" else 0
@@ -345,6 +403,7 @@ def main():
         manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"format": 1, "agents": {}}
         if manifest.get("format") != 1:
             raise ValueError("Unsupported installation manifest format")
+        prepare_records(manifest, agents, args.scope, root, base, args.action)
         if args.action == "doctor":
             return doctor(manifest, agents, root)
         changes = Changes()

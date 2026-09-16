@@ -26,7 +26,7 @@ BINARY = next((p for p in (CHECKOUT / "target/debug/tgrep", CHECKOUT / "target/r
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tgrep agent 'tests ")
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.project = self.root / "project"
         self.project.mkdir()
         self.base = self.project / ".tgrep-agent"
@@ -139,12 +139,80 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(first.read_bytes(), b"original")
         self.assertFalse(second.exists())
 
+    def test_symlinked_installation_components_do_not_write_outside_root(self):
+        for name in (".codex", ".pi", ".pi/extensions", ".tgrep-agent", ".tgrep-agent/codex", ".tgrep-agent/backups"):
+            with self.subTest(name=name):
+                target = self.root / "external"
+                target.mkdir(exist_ok=True)
+                link = self.project / name
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    self.run_install()
+                self.assertEqual(list(target.iterdir()), [])
+                link.unlink()
+
+    def test_symlinked_atomic_parent_and_manifest_target_rejected(self):
+        target = self.root / "external"
+        target.mkdir()
+        (self.project / "alias").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            install.atomic(self.project / "alias/new.txt", b"no")
+        self.run_install()
+        manifest_path = self.base / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        external = target / "owned.txt"
+        external.write_text("external data")
+        manifest["agents"]["codex"]["records"][0] = {"kind": "file", "path": str(external), "sha256": install.digest(external.read_bytes())}
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Unexpected manifest"):
+            self.run_install("uninstall", "codex")
+        self.assertEqual(external.read_text(), "external data")
+
+    def test_copied_project_repairs_and_uninstalls_only_new_location(self):
+        self.run_install()
+        original = self.project
+        snapshot = {p.relative_to(original): p.read_bytes() for p in original.rglob("*") if p.is_file()}
+        moved = self.root / "moved"
+        shutil.copytree(original, moved)
+        self.project, self.base = moved, moved / ".tgrep-agent"
+        with self.assertRaisesRegex(ValueError, "Project moved"):
+            self.run_install("doctor")
+        # Repair just one agent first, leaving the other migration for later.
+        self.run_install("repair", "codex")
+        self.assertEqual(json.loads((self.base / "codex/config.json").read_text())["root"], str(moved))
+        self.run_install("uninstall", "pi")
+        self.assertFalse((moved / ".pi/extensions/tgrep.ts").exists())
+        self.run_install("uninstall", "codex")
+        for path, data in snapshot.items():
+            self.assertEqual((original / path).read_bytes(), data)
+
+    def test_inline_hooks_win_when_both_sources_exist(self):
+        codex = self.project / ".codex"
+        codex.mkdir()
+        (codex / "config.toml").write_text('[[hooks.SessionStart]]\nmatcher="startup"\nhooks=[]\n')
+        json_hooks = b'{"hooks": {"SessionStart": []}}\n'
+        (codex / "hooks.json").write_bytes(json_hooks)
+        self.run_install(agent="codex")
+        self.assertEqual((codex / "hooks.json").read_bytes(), json_hooks)
+        self.assertEqual(len(tomllib.loads((codex / "config.toml").read_text())["hooks"]["SessionStart"]), 2)
+        self.run_install("uninstall", "codex")
+        self.assertEqual((codex / "hooks.json").read_bytes(), json_hooks)
+
+    def test_template_tokens_in_paths_are_literal(self):
+        self.project = self.root / "__TOOLS____CONFIG____INSTRUCTIONS__"
+        self.project.mkdir()
+        self.run_install(agent="pi")
+        source = (self.project / ".pi/extensions/tgrep.ts").read_text()
+        config_line = next(line for line in source.splitlines() if line.startswith("const config ="))
+        self.assertEqual(json.loads(config_line.removeprefix("const config = ").removesuffix(";")), str(self.project / ".tgrep-agent/pi/config.json"))
+
 
 @unittest.skipUnless(BINARY, "Build tgrep before running runtime integration tests")
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tgrep runtime ")
-        self.directory = Path(self.temp.name)
+        self.directory = Path(self.temp.name).resolve()
         self.root = self.directory / "repo"
         self.root.mkdir()
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
@@ -161,7 +229,7 @@ class RuntimeTests(unittest.TestCase):
         for info in self.directory.glob("cache/*/index/serve.json"):
             try:
                 os.kill(json.loads(info.read_text())["pid"], signal.SIGTERM)
-            except (ProcessLookupError, FileNotFoundError):
+            except (ProcessLookupError, FileNotFoundError, KeyError):
                 pass
         time.sleep(0.05)
         self.temp.cleanup()
@@ -225,6 +293,54 @@ class RuntimeTests(unittest.TestCase):
             result = self.runtime.search("search_code", {"pattern": "needle"})["structuredContent"]
         self.assertEqual(result["search_mode"], "current_scan")
         self.assertTrue(result["results"])
+
+    def test_count_normalizes_paths_with_colons_and_newlines(self):
+        (self.root / "odd:name\nfile.txt").write_text("needle needle\nneedle\n")
+        result = self.search(pattern="needle", output_mode="count")
+        counts = {item["path"]: item["count"] for item in result["results"]}
+        self.assertEqual(counts["odd:name\nfile.txt"], 2)
+        self.assertEqual(counts["src/main.rs"], 2)
+        self.assertFalse(any(Path(p).is_absolute() for p in counts))
+
+    def test_plain_directory_excludes_managed_files_in_both_freshness_modes(self):
+        plain = self.directory / "plain"
+        plain.mkdir()
+        (plain / ".gitignore").write_text("/.tgrep-agent/\n")
+        (plain / ".tgrep-agent").mkdir()
+        (plain / ".tgrep-agent/secret.txt").write_text("managed_marker")
+        (plain / "visible.txt").write_text("visible_marker")
+        for root in (str(plain), None):
+            adapter = runtime.Runtime({**self.config, "root": root}, plain)
+            for freshness in ("current", "indexed"):
+                result = adapter.search("find_files", {"hidden": True, "freshness": freshness})["structuredContent"]
+                self.assertNotIn({"path": ".tgrep-agent/secret.txt"}, result["results"])
+                self.assertIn({"path": "visible.txt"}, result["results"])
+
+    def test_malformed_status_responses_are_unavailable(self):
+        from unittest.mock import MagicMock
+        self.runtime.index.mkdir(parents=True)
+        (self.runtime.index / "serve.json").write_text('{"port": 12345}')
+        for response in ([], 5, None, {"result": {}}, {"jsonrpc": "2.0", "id": 1, "result": []},
+                         {"jsonrpc": "2.0", "id": 1, "result": {"num_files": "wrong"}}):
+            with self.subTest(response=response):
+                connection = MagicMock()
+                connection.__enter__.return_value.makefile.return_value.__enter__.return_value.readline.return_value = json.dumps(response).encode()
+                with patch.object(runtime.socket, "create_connection", return_value=connection):
+                    self.assertIsNone(self.runtime.status())
+
+    def test_exit_race_does_not_mask_truncated_result(self):
+        actual_kill = os.killpg
+        def disappeared(pid, sig):
+            actual_kill(pid, sig)
+            raise ProcessLookupError("already exited")
+        # A producer that cannot exit before truncation triggers cleanup.
+        fake = self.directory / "producer"
+        fake.write_text(f"#!{sys.executable}\nimport time\nprint('a\\0b\\0', end='', flush=True)\ntime.sleep(60)\n")
+        fake.chmod(0o755)
+        self.runtime.binary = str(fake)
+        with patch.object(runtime.os, "killpg", side_effect=disappeared):
+            result = self.search("find_files", max_results=1)
+        self.assertTrue(result["truncated"])
 
     def test_doctor_exercises_installed_mcp(self):
         with patch.object(sys, "argv", ["install.py", "install", "--agent", "codex", "--root", str(self.root), "--binary", str(BINARY)]), contextlib.redirect_stdout(io.StringIO()):

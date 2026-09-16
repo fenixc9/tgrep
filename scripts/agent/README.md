@@ -34,15 +34,19 @@ The installer uses `--binary`, an executable on `PATH`, or a private copy of the
 checkout's release binary, in that order. If none is available it builds the
 checkout using `cargo build --release --locked -p tgrep-cli`; Cargo must be
 installed. It does not install agent applications or modify your shell PATH.
-Installation paths are absolute: reinstall after moving a checkout/project or
-changing the Python executable. Reinstall preserves the previous binary and
+Installation paths are absolute: run `repair --root /new/project` after moving
+or copying a project, or reinstall after changing the Python executable. Repair
+rebases owned file locations and regenerates configuration for the selected
+agents without reading or changing the old project. Run it for every installed
+agent; `doctor` reports integrations still pointing to the old root. Reinstall preserves the previous binary and
 index options unless replacements are supplied.
 
 ## What gets installed
 
 **Codex:** an `mcp_servers.tgrep` entry, a `SessionStart` command hook and a short
 managed section in `AGENTS.md`. Existing JSON hooks are merged; if the config
-already uses inline TOML hooks, the installer uses that representation. Other
+already uses inline TOML hooks, the installer uses that representation even if
+`hooks.json` also exists, leaving that JSON file unchanged. Other
 MCP servers, hooks and instructions remain intact.
 
 Restart Codex after installation. Project configuration must be trusted. Current
@@ -83,6 +87,10 @@ Both tools accept:
 - `hidden`: include hidden non-ignored files.
 - `max_results`: 1–1000 output records (default 100). Context rows count too.
 
+Count results contain a repository-relative `path` and numeric `count` of
+matching lines. Counts come from JSON statistics, so filenames containing
+colons or newlines remain unambiguous.
+
 Output is capped at approximately 48 KB of result records, plus metadata. An
 oversized individual line may produce a truncated response with no records;
 narrow the query or use files/count output. Queries time out after 30 seconds
@@ -107,6 +115,8 @@ $XDG_CACHE_HOME/tgrep-agent/<key>/   Shared service state (default ~/.cache)
 ```
 
 Project installation adds a managed `/.tgrep-agent/` entry to `.gitignore`.
+In non-Git session roots, both service and query commands automatically enable
+`--no-require-git` so this exclusion (and other `.gitignore` rules) takes effect.
 `CODEX_HOME` and `PI_CODING_AGENT_DIR` are respected for user configuration.
 The same configuration across Codex/pi or project/user installs shares a
 service. Different worktrees and index options get separate services.
@@ -134,6 +144,13 @@ outside managed blocks survive reinstall and uninstall. Config writes are
 atomic per file, with rollback on write failure and recovery snapshots under
 `backups/<timestamp>/paths.json`. This is not a crash-atomic transaction across
 all files; backups are available if the machine exits during a transaction.
+
+Installation preflights owned paths and rejects symlinks in their existing
+components, including configuration directories, state, locks and backups.
+Manifest targets are checked against the selected agent's exact destination
+allowlist before being read or removed. These checks protect against preexisting
+redirects; installation assumes another process is not concurrently replacing
+parent directories during the operation.
 
 If you modify an owned runtime, extension or managed block, installation and
 uninstallation stop before writing configuration and identify the conflict.

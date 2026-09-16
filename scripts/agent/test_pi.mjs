@@ -23,6 +23,15 @@ try {
   assert.ok(matches.details.results.length > 0);
   assert.deepEqual(files.details.results, [{ path: "src/main.rs" }]);
   await assert.rejects(() => tools.get("tgrep_search_code").execute("3", { pattern: "[", literal: false, freshness: "current" }, undefined, undefined, ctx));
+  // A disconnect after connect() returns but before execute() resumes must
+  // reject immediately, not silently wait for the 40-second request timer.
+  const started = Date.now();
+  const racing = tools.get("tgrep_find_files").execute("4", { freshness: "current" }, undefined, undefined, ctx);
+  hooks.get("session_shutdown")();
+  await assert.rejects(racing, /disconnected/);
+  assert.ok(Date.now() - started < 2000);
+  const reconnected = await tools.get("tgrep_find_files").execute("5", { pattern: "*.rs", freshness: "current" }, undefined, undefined, ctx);
+  assert.deepEqual(reconnected.details.results, [{ path: "src/main.rs" }]);
 } finally {
   hooks.get("session_shutdown")();
 }

@@ -27,11 +27,21 @@ export default function (pi: any) {
     const id = ++sequence;
     return new Promise((resolve, reject) => {
       if (signal?.aborted) return reject(new Error("Cancelled"));
+      const connection = child;
+      if (!connection || connection.exitCode !== null || connection.signalCode !== null ||
+          !connection.stdin || connection.stdin.destroyed || !connection.stdin.writable) {
+        stop();
+        return reject(new Error("tgrep MCP disconnected; retry to reconnect"));
+      }
       const timer = setTimeout(() => cancel("tgrep MCP timed out"), 40000);
       function cleanup() { clearTimeout(timer); signal?.removeEventListener("abort", abort); pending.delete(id); }
       function cancel(message: string) {
-        child?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }) + "\n");
         cleanup();
+        try {
+          if (connection.stdin?.writable && !connection.stdin.destroyed) {
+            connection.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }) + "\n");
+          }
+        } catch { /* Disconnect must not prevent cancellation from settling. */ }
         reject(new Error(message));
       }
       function abort() { cancel("Cancelled"); }
@@ -40,7 +50,14 @@ export default function (pi: any) {
         resolve(value) { cleanup(); resolve(value); },
         reject(error) { cleanup(); reject(error); },
       });
-      child?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      try {
+        connection.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n", (error) => {
+          if (error) { cleanup(); reject(error); }
+        });
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
     });
   }
 

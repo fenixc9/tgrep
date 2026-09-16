@@ -58,7 +58,7 @@ TOOLS = [
 ]
 
 
-def repository(cwd: Path) -> Path:
+def git_root(cwd: Path) -> Path | None:
     cwd = cwd.resolve(strict=True)
     try:
         result = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
@@ -67,7 +67,11 @@ def repository(cwd: Path) -> Path:
             return Path(result.stdout.strip()).resolve()
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return cwd
+    return None
+
+
+def repository(cwd: Path) -> Path:
+    return git_root(cwd) or cwd.resolve(strict=True)
 
 
 def validate(name: str, args: dict) -> dict:
@@ -104,7 +108,11 @@ class Runtime:
         self.config = config
         self.root = Path(config["root"]).resolve() if config.get("root") else repository(cwd or Path.cwd())
         self.binary = config["binary"]
-        self.flags = config.get("index_flags", [])
+        self.flags = list(config.get("index_flags", []))
+        # Apply the installer's .gitignore exclusion in plain directories too.
+        # Resolve per session so user-scope installs handle both Git and non-Git.
+        if git_root(self.root) is None and "--no-require-git" not in self.flags:
+            self.flags.append("--no-require-git")
         identity = json.dumps([str(self.root), self.flags], sort_keys=True).encode()
         cache = Path(config["cache_dir"])
         self.state = cache / hashlib.sha256(identity).hexdigest()[:24]
@@ -117,7 +125,12 @@ class Runtime:
                 sock.sendall(b'{"jsonrpc":"2.0","id":1,"method":"status"}\n')
                 with sock.makefile("rb") as stream:
                     reply = json.loads(stream.readline(65536))
-            return reply.get("result")
+            if not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0" or reply.get("id") != 1:
+                return None
+            result = reply.get("result")
+            if not isinstance(result, dict) or type(result.get("num_files")) is not int:
+                return None
+            return result
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
@@ -186,7 +199,9 @@ class Runtime:
             elif mode == "files":
                 cmd += ["-l", "--null"]
             else:
-                cmd += ["-c", "--with-filename"]
+                # CLI count output cannot escape arbitrary filenames. JSON end
+                # records provide matched-line counts with unambiguous paths.
+                cmd += ["--json", "-C", "0"]
             cmd += ["--", args["pattern"], str(path)]
         # CLI can also scan for positive glob overrides or incomplete coverage.
         mode = "current_scan" if current else "indexed_or_scan"
@@ -224,18 +239,23 @@ class Runtime:
                 if name == "find_files" and not (fnmatch.fnmatchcase(text, pattern) or fnmatch.fnmatchcase(Path(text).name, pattern)):
                     return
                 item = {"path": text}
-            elif args.get("output_mode") == "content":
+            else:
                 event = json.loads(text)
-                if event["type"] not in ("match", "context"):
+                count_mode = args.get("output_mode") == "count"
+                if event["type"] not in (("end",) if count_mode else ("match", "context")):
                     return
                 data = event["data"]
-                item = {"path": data["path"]["text"], "line": data["line_number"],
-                        "text": data["lines"]["text"].rstrip("\n"), "kind": event["type"]}
+                item = {"path": data["path"]["text"]}
+                if count_mode:
+                    item["count"] = data["stats"]["matched_lines"]
+                    if not item["count"]:
+                        return
+                else:
+                    item.update({"line": data["line_number"],
+                                 "text": data["lines"]["text"].rstrip("\n"), "kind": event["type"]})
                 p = Path(item["path"])
                 if p.is_absolute():
                     item["path"] = str(p.relative_to(self.root))
-            else:
-                item = {"text": text}
             size = len(json.dumps(item, ensure_ascii=False).encode())
             if len(records) >= args["max_results"] or total_bytes + size > byte_budget:
                 truncated = True
@@ -276,7 +296,10 @@ class Runtime:
                     raise ValueError(warnings.decode(errors="replace") or f"tgrep exited with {code}")
         finally:
             if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             proc.wait()
             proc.stdout.close()
             proc.stderr.close()
