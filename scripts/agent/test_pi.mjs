@@ -32,6 +32,25 @@ try {
   assert.ok(Date.now() - started < 2000);
   const reconnected = await tools.get("tgrep_find_files").execute("5", { pattern: "*.rs", freshness: "current" }, undefined, undefined, ctx);
   assert.deepEqual(reconnected.details.results, [{ path: "src/main.rs" }]);
+  // An already-aborted tool call must reject before spawning an adapter: the
+  // missing working directory would otherwise surface as a spawn error.
+  hooks.get("session_shutdown")();
+  const aborted = new AbortController();
+  aborted.abort();
+  const abortedAt = Date.now();
+  await assert.rejects(() => tools.get("tgrep_search_code").execute("6", { pattern: "needle", freshness: "current" }, aborted.signal, undefined, { cwd: process.argv[3] + "/missing" }), /Cancelled/);
+  assert.ok(Date.now() - abortedAt < 2000);
+  const afterAbort = await tools.get("tgrep_find_files").execute("7", { pattern: "*.rs", freshness: "current" }, undefined, undefined, ctx);
+  assert.deepEqual(afterAbort.details.results, [{ path: "src/main.rs" }]);
+  // A call that aborts while another call is still initializing must reject
+  // immediately while the shared startup completes for the first caller.
+  hooks.get("session_shutdown")();
+  const startup = tools.get("tgrep_find_files").execute("8", { pattern: "*.rs", freshness: "current" }, undefined, undefined, ctx);
+  const controller = new AbortController();
+  const racingStartup = tools.get("tgrep_find_files").execute("9", { pattern: "*.rs", freshness: "current" }, controller.signal, undefined, ctx);
+  controller.abort();
+  await assert.rejects(racingStartup, /Cancelled/);
+  assert.deepEqual((await startup).details.results, [{ path: "src/main.rs" }]);
 } finally {
   hooks.get("session_shutdown")();
 }

@@ -23,6 +23,14 @@ export default function (pi: any) {
     pending.clear();
   }
 
+  function cancelled(signal?: AbortSignal): Promise<never> {
+    return new Promise((_, reject) => {
+      if (!signal) return;
+      if (signal.aborted) return reject(new Error("Cancelled"));
+      signal.addEventListener("abort", () => reject(new Error("Cancelled")), { once: true });
+    });
+  }
+
   function request(method: string, params: any, signal?: AbortSignal): Promise<any> {
     const id = ++sequence;
     return new Promise((resolve, reject) => {
@@ -61,8 +69,11 @@ export default function (pi: any) {
     });
   }
 
-  async function connect(cwd: string) {
-    if (starting) return starting;
+  async function connect(cwd: string, signal?: AbortSignal) {
+    if (signal?.aborted) throw new Error("Cancelled");
+    // A request that starts while initialization is still running must not wait
+    // out the whole startup timeout when its own signal aborts.
+    if (starting) return signal ? Promise.race([starting, cancelled(signal)]) : starting;
     starting = (async () => {
       const process = spawn(python, [runtime, "mcp", "--config", config], { cwd, stdio: ["pipe", "pipe", "pipe"] });
       child = process;
@@ -80,7 +91,7 @@ export default function (pi: any) {
       });
       const init = await request("initialize", {
         protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "tgrep-pi", version: "1.0.0" },
-      });
+      }, signal);
       if (!init.capabilities?.tools) throw new Error("tgrep MCP has no tools capability");
       process.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     })();
@@ -94,7 +105,7 @@ export default function (pi: any) {
       description: tool.description,
       parameters: tool.inputSchema,
       async execute(_id: string, args: any, signal: AbortSignal, _update: any, ctx: any) {
-        await connect(ctx.cwd);
+        await connect(ctx.cwd, signal);
         const result = await request("tools/call", { name: tool.name, arguments: args }, signal);
         if (result.isError) throw new Error(result.content.map((c: any) => c.text || "").join("\n"));
         return { content: result.content, details: result.structuredContent };

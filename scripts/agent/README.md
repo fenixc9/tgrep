@@ -35,11 +35,13 @@ checkout's release binary, in that order. If none is available it builds the
 checkout using `cargo build --release --locked -p tgrep-cli`; Cargo must be
 installed. It does not install agent applications or modify your shell PATH.
 Installation paths are absolute: run `repair --root /new/project` after moving
-or copying a project, or reinstall after changing the Python executable. Repair
-rebases owned file locations and regenerates configuration for the selected
-agents without reading or changing the old project. Run it for every installed
-agent; `doctor` reports integrations still pointing to the old root. Reinstall preserves the previous binary and
-index options unless replacements are supplied.
+or copying a project, or reinstall/`repair` after changing the Python
+executable. Repair rebases owned file locations and regenerates configuration
+for the selected agents without reading or changing the old project. Run it for
+every installed agent; `doctor` reports integrations still pointing to the old
+root and fails when the interpreter recorded at installation time no longer
+runs. Reinstall preserves the previous binary and index options unless
+replacements are supplied.
 
 ## What gets installed
 
@@ -48,6 +50,11 @@ managed section in `AGENTS.md`. Existing JSON hooks are merged; if the config
 already uses inline TOML hooks, the installer uses that representation even if
 `hooks.json` also exists, leaving that JSON file unchanged. Other
 MCP servers, hooks and instructions remain intact.
+
+`mcp_servers` and `hooks` have to be written as `[mcp_servers.<name>]` and
+`[[hooks.SessionStart]]` tables. TOML cannot extend an inline
+(`mcp_servers = { ... }`) or dotted definition, so installation stops with an
+explicit error instead of appending a block that would not parse.
 
 Restart Codex after installation. Project configuration must be trusted. Current
 Codex requires review/trust of new or changed hooks in `/hooks`; the installer
@@ -86,6 +93,7 @@ Both tools accept:
 - `freshness: "current"`: use `--no-index`, for checking recent edits.
 - `hidden`: include hidden non-ignored files.
 - `max_results`: 1–1000 output records (default 100). Context rows count too.
+- `file_types` and `glob`: at most 100 entries, 16 KB each and 64 KB together.
 
 Count results contain a repository-relative `path` and numeric `count` of
 matching lines. Counts come from JSON statistics, so filenames containing
@@ -117,6 +125,9 @@ $XDG_CACHE_HOME/tgrep-agent/<key>/   Shared service state (default ~/.cache)
 Project installation adds a managed `/.tgrep-agent/` entry to `.gitignore`.
 In non-Git session roots, both service and query commands automatically enable
 `--no-require-git` so this exclusion (and other `.gitignore` rules) takes effect.
+The managed cache directory and the per-repository state directory must not be
+symlinks: the installer and the runtime both refuse to write service state
+through them.
 `CODEX_HOME` and `PI_CODING_AGENT_DIR` are respected for user configuration.
 The same configuration across Codex/pi or project/user installs shares a
 service. Different worktrees and index options get separate services.

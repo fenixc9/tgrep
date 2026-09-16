@@ -74,6 +74,13 @@ def repository(cwd: Path) -> Path:
     return git_root(cwd) or cwd.resolve(strict=True)
 
 
+def reject_symlinks(path):
+    """Service state must not be redirected through symlinked cache components."""
+    for component in (path, *path.parents):
+        if component.is_symlink():
+            raise ValueError(f"Refusing symlink in service state path: {component}")
+
+
 def validate(name: str, args: dict) -> dict:
     tool = next((t for t in TOOLS if t["name"] == name), None)
     if tool is None or not isinstance(args, dict):
@@ -93,8 +100,11 @@ def validate(name: str, args: dict) -> dict:
             raise ValueError(f"Invalid type for {key}")
         if isinstance(value, str) and ("\0" in value or len(value) > 16384):
             raise ValueError(f"Invalid string for {key}")
-        if isinstance(value, list) and (len(value) > 100 or any(type(v) is not str or "\0" in v for v in value)):
-            raise ValueError(f"Invalid list for {key}")
+        if isinstance(value, list):
+            if len(value) > 100 or any(type(v) is not str or "\0" in v or len(v) > 16384 for v in value):
+                raise ValueError(f"Invalid list for {key}")
+            if sum(len(v) for v in value) > 65536:
+                raise ValueError(f"List too large for {key}")
         if "enum" in prop and value not in prop["enum"]:
             raise ValueError(f"Invalid value for {key}")
         if "minimum" in prop and not prop["minimum"] <= value <= prop["maximum"]:
@@ -117,10 +127,21 @@ class Runtime:
         cache = Path(config["cache_dir"])
         self.state = cache / hashlib.sha256(identity).hexdigest()[:24]
         self.index = self.state / "index"
+        reject_symlinks(self.state)
+        reject_symlinks(self.index)
 
     def status(self):
         try:
             info = json.loads((self.index / "serve.json").read_text())
+            if (not isinstance(info, dict) or type(info.get("port")) is not int or type(info.get("pid")) is not int
+                    or info["pid"] <= 0):
+                return None
+            try:
+                # A stale record can outlive its server while another process
+                # reuses the port; only trust a server we are still running.
+                os.kill(info["pid"], 0)
+            except OSError:
+                return None
             with socket.create_connection(("127.0.0.1", info["port"]), timeout=0.3) as sock:
                 sock.sendall(b'{"jsonrpc":"2.0","id":1,"method":"status"}\n')
                 with sock.makefile("rb") as stream:

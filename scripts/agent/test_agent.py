@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import shutil
 import selectors
+import socket
 import subprocess
 import sys
 import tempfile
@@ -207,6 +208,46 @@ class InstallerTests(unittest.TestCase):
         config_line = next(line for line in source.splitlines() if line.startswith("const config ="))
         self.assertEqual(json.loads(config_line.removeprefix("const config = ").removesuffix(";")), str(self.project / ".tgrep-agent/pi/config.json"))
 
+    def test_inline_toml_tables_are_reported_instead_of_broken(self):
+        codex = self.project / ".codex"
+        codex.mkdir()
+        cases = [
+            ("mcp_servers = { other = { command = \"other\" } }\n", "mcp_servers as an inline"),
+            ("hooks = { SessionStart = [] }\n", "hooks as an inline"),
+            ('[hooks]\nSessionStart = [{ matcher = "x", hooks = [] }]\n', "Cannot merge the managed tgrep block"),
+        ]
+        for original, message in cases:
+            with self.subTest(message=message):
+                (codex / "config.toml").write_text(original)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.run_install(agent="codex")
+                self.assertEqual((codex / "config.toml").read_text(), original)
+                self.assertFalse((self.base / "codex/runtime.py").exists())
+
+    def test_user_scope_ignores_project_owned_symlinks(self):
+        target = self.root / "external"
+        target.mkdir()
+        (self.project / "AGENTS.md").symlink_to(target / "agents.md")
+        (self.project / ".gitignore").symlink_to(target / "ignore")
+        with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex-config"),
+                                     "PI_CODING_AGENT_DIR": str(self.root / "pi-config")}):
+            self.run_install(agent="codex,pi", extra=["--scope", "user"])
+            self.assertTrue((self.root / "codex-config/config.toml").exists())
+            self.assertTrue((self.root / "pi-config/extensions/tgrep.ts").exists())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_doctor_reports_missing_interpreter(self):
+        missing = self.root / "missing-python"
+        with patch.object(sys, "executable", str(missing)):
+            self.run_install(agent="codex")
+        self.assertEqual(json.loads((self.base / "codex/config.json").read_text())["python"], str(missing))
+        argv = ["install.py", "doctor", "--agent", "codex", "--root", str(self.project), "--binary", str(self.fake)]
+        output = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+            code = install.main()
+        self.assertEqual(code, 1)
+        self.assertIn("missing-python", output.getvalue())
+
 
 @unittest.skipUnless(BINARY, "Build tgrep before running runtime integration tests")
 class RuntimeTests(unittest.TestCase):
@@ -228,8 +269,12 @@ class RuntimeTests(unittest.TestCase):
     def tearDown(self):
         for info in self.directory.glob("cache/*/index/serve.json"):
             try:
-                os.kill(json.loads(info.read_text())["pid"], signal.SIGTERM)
-            except (ProcessLookupError, FileNotFoundError, KeyError):
+                pid = json.loads(info.read_text())["pid"]
+                # Never signal the runner itself or a whole process group.
+                if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+                    continue
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, FileNotFoundError, KeyError, ValueError):
                 pass
         time.sleep(0.05)
         self.temp.cleanup()
@@ -319,7 +364,8 @@ class RuntimeTests(unittest.TestCase):
     def test_malformed_status_responses_are_unavailable(self):
         from unittest.mock import MagicMock
         self.runtime.index.mkdir(parents=True)
-        (self.runtime.index / "serve.json").write_text('{"port": 12345}')
+        # A live pid is recorded so the reply shape, not the liveness check, is exercised.
+        (self.runtime.index / "serve.json").write_text(json.dumps({"pid": os.getpid(), "port": 12345}))
         for response in ([], 5, None, {"result": {}}, {"jsonrpc": "2.0", "id": 1, "result": []},
                          {"jsonrpc": "2.0", "id": 1, "result": {"num_files": "wrong"}}):
             with self.subTest(response=response):
@@ -327,6 +373,40 @@ class RuntimeTests(unittest.TestCase):
                 connection.__enter__.return_value.makefile.return_value.__enter__.return_value.readline.return_value = json.dumps(response).encode()
                 with patch.object(runtime.socket, "create_connection", return_value=connection):
                     self.assertIsNone(self.runtime.status())
+
+    def test_status_requires_a_live_recorded_server(self):
+        self.runtime.index.mkdir(parents=True)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        try:
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            for record in ({"pid": dead.pid, "port": listener.getsockname()[1]},
+                           {"port": listener.getsockname()[1]},
+                           {"pid": 0, "port": listener.getsockname()[1]}):
+                with self.subTest(record=record):
+                    (self.runtime.index / "serve.json").write_text(json.dumps(record))
+                    with patch.object(runtime.socket, "create_connection") as connect:
+                        self.assertIsNone(self.runtime.status())
+                        connect.assert_not_called()
+        finally:
+            listener.close()
+
+    def test_symlinked_service_state_is_rejected(self):
+        external = self.directory / "external-state"
+        external.mkdir()
+        self.runtime.state.parent.mkdir(parents=True)
+        self.runtime.state.symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            runtime.Runtime(self.config)
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_list_argument_bounds(self):
+        with self.assertRaisesRegex(ValueError, "Invalid list"):
+            self.search(pattern="x", file_types=["a" * 16385])
+        with self.assertRaisesRegex(ValueError, "too large"):
+            self.search(pattern="x", glob=["g" * 4096] * 17)
 
     def test_exit_race_does_not_mask_truncated_result(self):
         actual_kill = os.killpg

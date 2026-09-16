@@ -59,6 +59,23 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def reject_inline_tables(path, text, key, dotted=False):
+    """Refuse to append [key.child] headers after an inline/dotted definition.
+
+    Keys after the first table header are not top level, so only the preamble
+    can define the table these headers extend.
+    """
+    inline = re.compile(rf"\s*{re.escape(key)}\s*=")
+    dotted_key = re.compile(rf"\s*{re.escape(key)}\s*\.")
+    for line in text.splitlines():
+        if re.match(r"\s*\[", line):
+            break
+        if inline.match(line) or (dotted and dotted_key.match(line)):
+            raise ValueError(
+                f"{path} defines {key} as an inline or dotted table; "
+                f"convert it to [{key}.<name>] headers before installing")
+
+
 def marked(agent, label, content, markdown=False):
     start = f"tgrep-agent:{agent}:{label}:begin"
     end = f"tgrep-agent:{agent}:{label}:end"
@@ -188,7 +205,9 @@ def install_agent(agent, args, root, base, binary, changes):
     directory = base / agent
     runtime = directory / "runtime.py"
     configuration = directory / "config.json"
-    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "tgrep-agent"
+    # Resolve the user's cache root but refuse a symlinked tgrep-agent component.
+    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser().resolve() / "tgrep-agent"
+    reject_symlinks(cache)
     flags = []
     if args.no_require_git:
         flags.append("--no-require-git")
@@ -197,7 +216,8 @@ def install_agent(agent, args, root, base, binary, changes):
     elif args.max_filesize:
         flags += ["--max-filesize", args.max_filesize]
     config = {"root": str(root) if args.scope == "project" else None,
-              "binary": binary, "cache_dir": str(cache.resolve()), "index_flags": flags}
+              "binary": binary, "cache_dir": str(cache), "index_flags": flags,
+              "python": sys.executable}
     changes.file(runtime, (SOURCE / "runtime.py").read_bytes(), records)
     changes.file(configuration, (json.dumps(config, indent=2) + "\n").encode(), records)
     agent_dir = agent_paths(agent, args.scope, root)
@@ -206,10 +226,16 @@ def install_agent(agent, args, root, base, binary, changes):
         path = agent_dir / "config.toml"
         existing = (changes.get(path) or b"").decode()
         parsed = tomllib.loads(existing)
-        if "tgrep" in parsed.get("mcp_servers", {}):
+        servers = parsed.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            raise ValueError(f"{path} defines mcp_servers as {type(servers).__name__}; expected a table")
+        if "tgrep" in servers:
             raise ValueError(f"An unmanaged MCP server named tgrep exists in {path}")
         if parsed.get("features", {}).get("hooks") is False:
             raise ValueError(f"Hooks are disabled in {path}; enable them before installing the full integration")
+        reject_inline_tables(path, existing, "mcp_servers")
+        if "hooks" in parsed:
+            reject_inline_tables(path, existing, "hooks", dotted=True)
         block = "\n".join([
             "[mcp_servers.tgrep]", f"command = {json.dumps(sys.executable)}",
             "args = " + json.dumps([str(runtime), "mcp", "--config", str(configuration)]),
@@ -234,7 +260,12 @@ def install_agent(agent, args, root, base, binary, changes):
             block += "\n[[hooks.SessionStart.hooks]]\ntype = \"command\"\ncommand = " + json.dumps(hook["hooks"][0]["command"])
             block += "\ntimeout = 5\nasync = true"
         changes.block(path, marked(agent, "config", block), records)
-        tomllib.loads(changes.get(path).decode())
+        try:
+            tomllib.loads(changes.get(path).decode())
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(
+                f"Cannot merge the managed tgrep block into {path}: {error}. "
+                "Convert inline or dotted mcp_servers/hooks tables to [table] headers, then retry") from error
         instruction_path = root / "AGENTS.md" if args.scope == "project" else agent_dir / "AGENTS.md"
         changes.block(instruction_path, marked(agent, "instructions", "Use the tgrep MCP tools when available. " + INSTRUCTIONS, True), records)
     else:
@@ -306,9 +337,14 @@ def doctor(manifest, agents, root):
             config_record = next(r for r in entry["records"] if r["path"].endswith("/config.json"))
             runtime_record = next(r for r in entry["records"] if r["path"].endswith("/runtime.py"))
             config = entry["config"]
+            # Probe the interpreter recorded at installation time: the generated
+            # Codex command and pi extension embed it, so a removed or replaced
+            # Python must fail here rather than being reported as healthy.
+            interpreter = config.get("python") or sys.executable
+            subprocess.run([interpreter, "--version"], capture_output=True, check=True, timeout=5)
             subprocess.run([config["binary"], "--version"], capture_output=True, check=True, timeout=5)
             # Probe the installed MCP executable, rather than the checkout source.
-            process = subprocess.Popen([sys.executable, runtime_record["path"], "mcp", "--config", config_record["path"]],
+            process = subprocess.Popen([interpreter, runtime_record["path"], "mcp", "--config", config_record["path"]],
                                        cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             try:
                 import selectors
@@ -392,7 +428,12 @@ def main():
                      agent_dir / "extensions/tgrep.ts", base / agent / "runtime.py",
                      base / agent / "config.json"):
             reject_symlinks(path)
-    for path in (manifest_path, base / "install.lock", base / "backups", root / "AGENTS.md", root / ".gitignore"):
+    owned = [manifest_path, base / "install.lock", base / "backups"]
+    if args.scope == "project":
+        # User scope never writes project-owned files, so unrelated symlinks in
+        # the current repository must not block it.
+        owned += [root / "AGENTS.md", root / ".gitignore"]
+    for path in owned:
         reject_symlinks(path)
     if args.action in ("doctor", "uninstall") and not manifest_path.exists():
         print("No tgrep integration installed in this scope.")
