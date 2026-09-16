@@ -95,7 +95,11 @@ export default function (pi: any) {
       if (!init.capabilities?.tools) throw new Error("tgrep MCP has no tools capability");
       process.stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
     })();
-    try { await starting; } catch (error) { stop(); throw error; }
+    const attempt = starting;
+    try { await attempt; } catch (error) {
+      if (starting === attempt) stop();
+      throw error;
+    }
   }
 
   for (const tool of tools) {
