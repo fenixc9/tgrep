@@ -206,7 +206,7 @@ def install_agent(agent, args, root, base, binary, changes):
     runtime = directory / "runtime.py"
     configuration = directory / "config.json"
     # Resolve the user's cache root but refuse a symlinked tgrep-agent component.
-    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser().resolve() / "tgrep-agent"
+    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))).expanduser().absolute() / "tgrep-agent"
     reject_symlinks(cache)
     flags = []
     if args.no_require_git:
